@@ -285,6 +285,16 @@ class ArtistDetailsPlugin:
         self._add_target(album.id, artists, destination_metadata)
         self._save_artist_metadata(album.id)
 
+    def _save_all_pending_metadata(self):
+        """Saves artist metadata for all albums that have no pending requests.
+
+        Called after any cache update so that albums waiting on a shared artist
+        or area fetch (which was initiated by a different album) also receive
+        their metadata when the data arrives.
+        """
+        for album_id in list(self.albums.keys()):
+            self._save_artist_metadata(album_id)
+
     def _save_artist_metadata(self, album_id):
         """Saves the new artist details variables to the metadata targets for the specified album.
 
@@ -365,7 +375,7 @@ class ArtistDetailsPlugin:
             self.result_cache[ARTIST][artist] = artist_info
         finally:
             self._album_remove_request(album)
-            self._save_artist_metadata(album.id)
+            self._save_all_pending_metadata()
 
     def _get_area_info(self, area_id, album):
         """Gets the area information from the MusicBrainz website.
@@ -401,7 +411,7 @@ class ArtistDetailsPlugin:
                     self._parse_area_relation(_id, rel, album, name, _type, type_text)
         finally:
             self._album_remove_request(album)
-            self._save_artist_metadata(album.id)
+            self._save_all_pending_metadata()
 
     @staticmethod
     def _area_logger(area_id, area_name, area_type):
