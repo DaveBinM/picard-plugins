@@ -58,7 +58,7 @@ artist processing, which can significantly increase the processing speed if you 
 Please see the <a href="https://github.com/rdswift/picard-plugins/blob/2.0_RDS_Plugins/plugins/additional_artists_details/docs/README.md">user
 guide</a> on GitHub for more information.
 '''
-PLUGIN_VERSION = '0.4'
+PLUGIN_VERSION = '0.5'
 PLUGIN_API_VERSIONS = ['2.0', '2.1', '2.2', '2.7', '2.8', '2.11']
 PLUGIN_LICENSE = 'GPL-2.0-or-later'
 PLUGIN_LICENSE_URL = 'https://www.gnu.org/licenses/gpl-2.0.html'
