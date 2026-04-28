@@ -161,6 +161,8 @@ class ArtistDetailsPlugin:
     }
     album_processing_count = {}
     albums = {}
+    _artist_subscribers = {}  # artist_id -> [albums waiting for this fetch to complete]
+    _area_subscribers = {}    # area_id   -> [albums waiting for this fetch to complete]
 
     def _make_empty_target(self, album_id):
         """Create an empty album target node if it doesn't exist.
@@ -280,20 +282,42 @@ class ArtistDetailsPlugin:
                 self.result_cache[ARTIST_REQUESTS].add(temp_id)
                 log.debug(*log_helper('Retrieving artist ID %s information from MusicBrainz.', temp_id))
                 self._get_artist_info(temp_id, album)
+            elif temp_id not in self.result_cache[ARTIST]:
+                # Fetch already in progress (initiated by another album); subscribe so this
+                # album's _requests stays elevated until the shared fetch completes.
+                log.debug(*log_helper('%s artist ID %s fetch in progress, subscribing.', source_type, temp_id))
+                self._artist_subscribers.setdefault(temp_id, []).append(album)
+                self._album_add_request(album)
             else:
                 log.debug(*log_helper('%s artist ID %s information available from cache.', source_type, temp_id))
+                # Artist cached; subscribe to any area fetches still in progress.
+                self._subscribe_pending_areas(self.result_cache[ARTIST][temp_id], album)
         self._add_target(album.id, artists, destination_metadata)
         self._save_artist_metadata(album.id)
 
-    def _save_all_pending_metadata(self):
-        """Saves artist metadata for all albums that have no pending requests.
+    def _subscribe_pending_areas(self, artist_info, album):
+        """Subscribe album to any area fetch still in progress for a cached artist.
 
-        Called after any cache update so that albums waiting on a shared artist
-        or area fetch (which was initiated by a different album) also receive
-        their metadata when the data arrives.
+        Called when the artist result is already in cache but one or more of its
+        areas may not be yet.  Follows the parent chain so that sub-area fetches
+        triggered by _parse_area_relation are also covered.
         """
-        for album_id in list(self.albums.keys()):
-            self._save_artist_metadata(album_id)
+        for area_key in ('area', 'begin-area', 'end-area'):
+            if area_key not in artist_info:
+                continue
+            area_id = artist_info[area_key]
+            visited = set()
+            while area_id and area_id not in visited:
+                visited.add(area_id)
+                if area_id not in self.result_cache[AREA]:
+                    if area_id in self.result_cache[AREA_REQUESTS]:
+                        self._area_subscribers.setdefault(area_id, []).append(album)
+                        self._album_add_request(album)
+                    break
+                area = self.result_cache[AREA][area_id]
+                if area.country:
+                    break
+                area_id = area.parent
 
     def _save_artist_metadata(self, album_id):
         """Saves the new artist details variables to the metadata targets for the specified album.
@@ -354,6 +378,7 @@ class ArtistDetailsPlugin:
     def _artist_submission_handler(self, document, _reply, error, artist=None, album=None):
         """Handles the response from the webservice requests for artist information.
         """
+        subscribers = self._artist_subscribers.pop(artist, [])
         try:
             if error:
                 log.error(*log_helper("Artist '%s' information retrieval error.", artist))
@@ -371,11 +396,23 @@ class ArtistDetailsPlugin:
                     area_id = document[item]['id']
                     artist_info[item] = area_id
                     if area_id not in self.result_cache[AREA_REQUESTS]:
+                        # New area fetch; subscribers must also wait for it.
+                        for sub_album in subscribers:
+                            self._album_add_request(sub_album)
+                        self._area_subscribers.setdefault(area_id, []).extend(subscribers)
                         self._get_area_info(area_id, album)
+                    elif area_id not in self.result_cache[AREA] and subscribers:
+                        # Area fetch already in progress; subscribe to it.
+                        for sub_album in subscribers:
+                            self._album_add_request(sub_album)
+                        self._area_subscribers.setdefault(area_id, []).extend(subscribers)
             self.result_cache[ARTIST][artist] = artist_info
         finally:
             self._album_remove_request(album)
-            self._save_all_pending_metadata()
+            self._save_artist_metadata(album.id)
+            for sub_album in subscribers:
+                self._album_remove_request(sub_album)
+                self._save_artist_metadata(sub_album.id)
 
     def _get_area_info(self, area_id, album):
         """Gets the area information from the MusicBrainz website.
@@ -398,6 +435,7 @@ class ArtistDetailsPlugin:
     def _area_submission_handler(self, document, _reply, error, area=None, album=None):
         """Handles the response from the webservice requests for area information.
         """
+        subscribers = self._area_subscribers.pop(area, [])
         try:
             if error:
                 log.error(*log_helper("Area '%s' information retrieval error.", area))
@@ -408,10 +446,13 @@ class ArtistDetailsPlugin:
                 self.result_cache[AREA][_id] = Area('', name, country, _type, type_text)
             if 'relations' in document:
                 for rel in document['relations']:
-                    self._parse_area_relation(_id, rel, album, name, _type, type_text)
+                    self._parse_area_relation(_id, rel, album, name, _type, type_text, subscribers)
         finally:
             self._album_remove_request(album)
-            self._save_all_pending_metadata()
+            self._save_artist_metadata(album.id)
+            for sub_album in subscribers:
+                self._album_remove_request(sub_album)
+                self._save_artist_metadata(sub_album.id)
 
     @staticmethod
     def _area_logger(area_id, area_name, area_type):
@@ -424,7 +465,7 @@ class ArtistDetailsPlugin:
         """
         log.debug(*log_helper("Adding area: %s => %s of type '%s'", area_id, area_name, area_type))
 
-    def _parse_area_relation(self, area_id, area_relation, album, area_name, area_type, area_type_text):
+    def _parse_area_relation(self, area_id, area_relation, album, area_name, area_type, area_type_text, subscribers=None):
         """Parse an area relation to extract the area information.
 
         Args:
@@ -434,6 +475,7 @@ class ArtistDetailsPlugin:
             area_name (str): Name of the area providing the relationship.
             area_type (str): MBID of the type of area providing the relationship.
             area_type_text (str): Text description of the area providing the relationship.
+            subscribers (list, optional): Albums waiting on the parent area fetch chain.
         """
         if 'type-id' not in area_relation or 'area' not in area_relation or area_relation['type-id'] != RELATIONSHIP_TYPE_PART_OF:
             return
@@ -453,6 +495,10 @@ class ArtistDetailsPlugin:
                     self.result_cache[AREA_REQUESTS].add(_id)
             else:
                 if _id not in self.result_cache[AREA] and _id not in self.result_cache[AREA_REQUESTS]:
+                    if subscribers:
+                        for sub_album in subscribers:
+                            self._album_add_request(sub_album)
+                        self._area_subscribers.setdefault(_id, []).extend(subscribers)
                     self._get_area_info(_id, album)
         else:
             self._area_logger(_id, name, type_text)
